@@ -10,6 +10,8 @@
 <a href="https://raptor.rl.tools" rel="Link to Project Page"><img src="https://github.com/rl-tools/raptor-media/blob/ef2dfc6ec650ad0226d74b9db33083cb9b39b4f7/raptor.rl.tools.gif" width='450'/></a>
 </div>
 
+## For Narma intern work reproduction, please refer to documentation in docs_narma/
+
 ## Usage
 If you want to use your own simulator:
 ```bash
