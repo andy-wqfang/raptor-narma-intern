@@ -4,3 +4,6 @@
 /mav*
 /*.csv
 /**/.DS_Store
+/.venv/
+/artifacts/
+*.pyc

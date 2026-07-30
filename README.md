@@ -113,6 +113,207 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Reproducing the paper on a headless server
+
+The repository now includes a deterministic, checkpoint-based reproduction of
+RAPTOR's robust position-keeping behavior. It runs eight L2F simulators and the
+released recurrent policy on the server, while the browser performs all
+Three.js/WebGL rendering. No remote display, GPU, or Docker daemon is required.
+
+Detailed implementation notes:
+
+- [Checkpoint-based paper reproduction](docs/checkpoint_reproduction.md)
+- [Hexacopter inference and visualization pipeline](docs/hexacopter_pipeline.md)
+- [Full RAPTOR training and Meta-Imitation Learning pipeline](docs/raptor_training_pipeline.md)
+
+### How RAPTOR works
+
+RAPTOR is trained in two stages:
+
+1. `src/foundation_policy/pre_training` trains 1,000 independent SAC teachers,
+   one for each fixed quadrotor configuration. A teacher is Markovian and sees
+   privileged motor-speed information.
+2. `src/foundation_policy/post_training` distills the teachers with
+   Meta-Imitation Learning. After 10 teacher-forcing epochs, the student is
+   rolled out on-policy so it learns to correct its own errors. The released
+   network is a 22-to-16 dense layer, a 16-unit GRU, and a 16-to-4 output layer:
+   2,084 parameters in total.
+
+The 22 policy inputs are position (3), row-major rotation matrix (9), linear
+velocity (3), body angular velocity (3), and previous action (4). The GRU's
+hidden state uses the resulting action/observation history to infer relevant
+dynamics online, including thrust-to-weight ratio, torque-to-inertia ratio, and
+motor lag.
+
+Teachers train on a 50/50 mixture of position holding and smooth
+second-order-Langevin trajectories. Episodes last 500 steps at 100 Hz and begin
+with adverse states including orientations up to 90 degrees.
+
+### Where drone configurations are created
+
+The entry point is
+[`rl-tools/src/foundation_policy/pre_training/sample_dynamics_parameters.cpp`](rl-tools/src/foundation_policy/pre_training/sample_dynamics_parameters.cpp).
+It seeds the sampler with zero, creates 1,000 configurations in
+`src/foundation_policy/dynamics_parameters`, and creates named Crazyflie, X500,
+MRS, FS, race, and Flightmare presets in `src/foundation_policy/registry`.
+Each resulting JSON disables further domain randomization so its teacher sees
+one fixed vehicle.
+
+The ancestral transformations are implemented in
+[`rl-tools/include/rl_tools/rl/environments/l2f/operations_generic/10_sample_initial_parameters.h`](rl-tools/include/rl_tools/rl/environments/l2f/operations_generic/10_sample_initial_parameters.h):
+
+- mass is sampled uniformly in cube-root size over 0.02--5 kg;
+- thrust-to-weight is sampled over 1.5--5 and scales all thrust-curve terms;
+- torque-to-inertia is sampled over 40--1,200 and determines diagonal inertia;
+- arm length scales with cube-root mass plus a size-deviation factor;
+- motor rise/fall constants are sampled over 0.03--0.10 s and 0.03--0.30 s;
+- rotor torque constant is sampled over 0.005--0.05;
+- disturbance-force variance is limited by surplus thrust.
+
+The size-deviation helper unintentionally draws a normal variate with mean
+`-range` and standard deviation `range`; the reproduction intentionally keeps
+that behavior.
+
+### Where visualizations are created
+
+There are two related visualization paths:
+
+- The project-page `l2f-studio` gitlink runs the L2F simulator and HDF5
+  checkpoint in browser WebAssembly. `index.js` constructs the 22 observations,
+  `l2f.js` advances the simulation, and Three.js renders the drones.
+- The Python path used here runs simulation and inference remotely. L2F
+  serializes parameters, state, and action to WebSocket messages. `ui-server`
+  relays those messages, and its generic browser page dynamically imports the
+  renderer returned by
+  [`rl-tools/include/rl_tools/rl/environments/l2f/operations_cpu.h`](rl-tools/include/rl_tools/rl/environments/l2f/operations_cpu.h).
+  That renderer constructs the body, arms, rotors, spin-direction colors, and
+  thrust arrows directly from each dynamics configuration.
+
+The UI relay does not render frames. It only serves static JavaScript and
+relays JSON, which is why it works on a server without a display.
+
+### Install and verify
+
+The required source submodule is pinned and can be initialized with:
+
+```bash
+git submodule update --init rl-tools
+```
+
+The `data` and `media` submodules are not needed for this checkpoint-based
+demo. Create a Python 3.10 environment and install the exact released stack:
+
+```bash
+/home/wqfang/miniconda3/envs/aero_vla/bin/python -m venv .venv
+.venv/bin/python -m pip install -r requirements-demo.txt
+```
+
+Download the current paper revision and official checkpoint, then verify their
+checksums:
+
+```bash
+./scripts/fetch_release_artifacts.sh
+```
+
+Run the 16-second accelerated acceptance scenario:
+
+```bash
+.venv/bin/python -m demo.position_hold --check
+```
+
+It tests eight deterministic vehicles. They first recover from randomized
+initial states, receive a `[1.0, -0.7, 0.4]` m/s velocity kick at 4 seconds,
+and receive a 25% mass/inertia payload increase at 8 seconds without resetting
+the recurrent policy. Results are written to
+`artifacts/position_hold/metrics.json` and `trajectory.npz`.
+
+### Testing the unchanged policy on a hexacopter
+
+[`demo/hexacopter.py`](demo/hexacopter.py) evaluates the released checkpoint on
+the open RotorS [AscTec Firefly
+model](https://github.com/ethz-asl/rotors_simulator/blob/master/rotors_description/urdf/firefly.xacro).
+It uses the published 1.5 kg mass, inertia matrix, six 0.215 m arms, rotor
+coordinates and spin directions, thrust/yaw constants, 838 rad/s limit, and
+12.5/25 ms asymmetric motor lag.
+
+RAPTOR is not modified and still emits four normalized virtual-motor commands
+in its native order. The adapter:
+
+1. interprets those commands through an equivalent X-quad mixer;
+2. obtains the requested `[collective thrust, roll, pitch, yaw]` wrench;
+3. solves a bounded allocation over the Firefly's six physical motors; and
+4. feeds the previous four virtual commands, not the six allocated commands,
+   back into RAPTOR's next observation.
+
+Run the headless acceptance test with:
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python -m demo.hexacopter --check
+```
+
+The scenario starts at a 30-degree tilt, applies the same velocity kick at 4
+seconds, and adds 25% mass/inertia at 8 seconds. It records policy outputs, all
+six motor commands/speeds, allocation residuals, poses, and pass/fail metrics
+under `artifacts/hexacopter`.
+
+This is a lightweight 6-DoF rigid-body and actuator test derived from RotorS
+parameters. It does not execute Gazebo's full aerodynamics, sensor/estimator
+stack, contacts, PX4 scheduling, or a real vehicle, so it is an interface
+feasibility result rather than hardware validation.
+
+### Browser visualization through SSH
+
+Start both continuously replaying pages:
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python -m demo.visualizers
+```
+
+The combined launcher exposes one remote-loopback website on port 13337. A
+path-aware gateway keeps the two simulation backends isolated while presenting
+them as subpages of the same browser origin.
+
+From the local computer, forward that one HTTP/WebSocket endpoint:
+
+```bash
+ssh -N -L 13337:127.0.0.1:13337 user@remote-host
+```
+
+Then open either page:
+
+- <http://127.0.0.1:13337/quadcopter/?L2FDisplayActions=true>
+- <http://127.0.0.1:13337/hexacopter/?L2FDisplayActions=true>
+
+The site root redirects to the quadcopter page. Navigation controls on both
+dashboards switch between the subpages. The same tunnel carries static assets
+and live websocket updates. Adding
+`L2FDisplayActions=true` displays motor-force arrows; drag the canvas to orbit
+the camera.
+
+The quadcopter dashboard explains the experiment, highlights the active
+recovery/kick/payload phase, lists all eight configurations, and labels the
+visualization-only 3-by-3 grid. The Firefly dashboard shows the
+four-command-to-six-motor allocation, episode phase, live position and attitude
+error, allocation residual, saturation count, source parameters, and all six
+motor coordinates/spin directions.
+
+For a persistent remote process containing both pages:
+
+```bash
+tmux new-session -d -s raptor-visualizers \
+  "cd /home/wqfang/raptor && OMP_NUM_THREADS=1 .venv/bin/python -m demo.visualizers"
+tmux attach -t raptor-visualizers
+```
+
+Stop it with `tmux kill-session -t raptor-visualizers`.
+
+Each page can still be run independently when desired:
+
+```bash
+OMP_NUM_THREADS=1 .venv/bin/python -m demo.position_hold --loop --port 13337
+OMP_NUM_THREADS=1 .venv/bin/python -m demo.hexacopter --loop --port 13338
+```
+
 ## Deployment
 For deployment onto flight controllers please refer to the reference implementations for PX4, Betaflight, Crazyflie and M5StampFly which are tracked in the [embedded_platforms](https://github.com/rl-tools/rl-tools/tree/3dea1bc877a8593dcd8349f6fdc4e362f025a0ca/embedded_platforms) folder.
 
