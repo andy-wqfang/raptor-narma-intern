@@ -10,7 +10,10 @@
 <a href="https://raptor.rl.tools" rel="Link to Project Page"><img src="https://github.com/rl-tools/raptor-media/blob/ef2dfc6ec650ad0226d74b9db33083cb9b39b4f7/raptor.rl.tools.gif" width='450'/></a>
 </div>
 
-## For Narma intern work reproduction, please refer to documentation in docs_narma/
+## Narma Inc.
+
+- **For Wenqu's intern work reproduction, please refer to documentation in docs_narma/**
+- **Below is the original repo's readme added with a description on how to set up visualization from a remote server. The added part is also reflected in docs_narma/**
 
 ## Usage
 If you want to use your own simulator:
